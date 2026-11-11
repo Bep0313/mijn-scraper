@@ -1,0 +1,18 @@
+name: nightly-scrape
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # elke nacht 03:00 UTC (= 04:00/05:00 NL/BE)
+  workflow_dispatch:       # handmatig testen via de Actions-tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Trigger nachtelijke scrape-all op Render
+        run: |
+          curl -sS -X POST --max-time 300 --retry 2 --retry-delay 20 \
+            -H "x-scraper-token: ${{ secrets.SCRAPER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ secrets.RENDER_BASE_URL }}/scrape-all"
