@@ -1,0 +1,6 @@
+mcp
+uvicorn
+requests
+beautifulsoup4
+lxml
+trafilatura
