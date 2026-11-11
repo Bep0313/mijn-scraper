@@ -33,12 +33,13 @@ except ImportError:
 import scrape
 
 API_TOKEN = os.environ.get("SCRAPER_TOKEN", "").strip()
-CACHE_TTL = 3600          # responses 1 uur cachen
-MAX_CACHE_ITEMS = 100     # voorkomt Out-Of-Memory (512 MB limiet op Render)
-MIN_DOMAIN_DELAY = 1.5    # min. seconden tussen requests naar hetzelfde domein
-USE_JINA_FALLBACK = True  # gebruik r.jina.ai als een JS-site of firewall blokkeert
+if not API_TOKEN:
+    raise RuntimeError("SCRAPER_TOKEN is niet ingesteld (zet deze als Environment variable in Render)")
 
-# stateless_http=True voorkomt sessie-crashes nadat Render uit slaapstand komt
+CACHE_TTL = 3600
+MAX_CACHE_ITEMS = 100
+MIN_DOMAIN_DELAY = 1.5
+
 mcp = FastMCP(
     "mijn-scraper",
     host="0.0.0.0",
@@ -65,21 +66,20 @@ def _domain(url: str) -> str:
 
 
 def _check_safe_url(url: str) -> None:
-    """Blokkeer lokale/interne IP-adressen (SSRF-beveiliging)."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Alleen http:// en https:// URL's zijn toegestaan")
-    hostname = parsed.hostname
-    if not hostname:
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise ValueError("Alleen http/https URL's toegestaan")
+    host = p.hostname
+    if not host:
         raise ValueError("Ongeldige URL")
-    if scrape.ALLOWED_DOMAINS and hostname.lower() not in scrape.ALLOWED_DOMAINS:
-        raise ValueError(f"Domein niet toegestaan: {hostname}")
+    if scrape.ALLOWED_DOMAINS and host.lower() not in scrape.ALLOWED_DOMAINS:
+        raise ValueError(f"Domein niet toegestaan: {host}")
     try:
-        ip = ipaddress.ip_address(socket.gethostbyname(hostname))
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise ValueError(f"Toegang tot intern netwerkadres geweigerd: {hostname}")
+        ip = ipaddress.ip_address(socket.gethostbyname(host))
     except socket.gaierror:
-        raise ValueError(f"Domeinnaam bestaat niet of kan niet worden gevonden: {hostname}")
+        raise ValueError(f"Domeinnaam onvindbaar: {host}")
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        raise ValueError(f"Intern netwerkadres geweigerd: {host}")
 
 
 def _throttle(domain: str) -> None:
@@ -95,66 +95,44 @@ def _robots_allows(url: str) -> bool:
     now = time.time()
     cached = _robots_cache.get(domain)
     if cached and now - cached[0] < CACHE_TTL:
-        return cached[1].can_fetch(scrape.USER_AGENT, url)
-
+        return cached[1]
     p = urlparse(url)
-    robots_url = f"{p.scheme}://{p.netloc}/robots.txt"
-    rp = urllib.robotparser.RobotFileParser()
+    allowed = True
     try:
-        r = requests.get(robots_url, headers={"User-Agent": scrape.USER_AGENT}, timeout=5)
+        r = requests.get(
+            f"{p.scheme}://{p.netloc}/robots.txt",
+            headers={"User-Agent": scrape.USER_AGENT},
+            timeout=5,
+        )
         if r.status_code == 200:
+            rp = urllib.robotparser.RobotFileParser()
             rp.parse(r.text.splitlines())
-        else:
-            # Bij 403/404 op robots.txt niet de hele site als verboden markeren
-            rp.allow_all = True
+            allowed = rp.can_fetch(scrape.USER_AGENT, url)
     except Exception:
-        rp.allow_all = True
-
+        allowed = True
     if len(_robots_cache) >= MAX_CACHE_ITEMS:
         _robots_cache.popitem(last=False)
-    _robots_cache[domain] = (now, rp)
-    return rp.can_fetch(scrape.USER_AGENT, url)
-
-
-def _fetch_jina_fallback(url: str) -> str:
-    """Haalt gerenderde Markdown op via Jina Reader voor lastige JS-pagina's."""
-    r = requests.get(
-        f"https://r.jina.ai/{url}",
-        headers={"User-Agent": scrape.USER_AGENT, "X-Return-Format": "markdown"},
-        timeout=25,
-    )
-    r.raise_for_status()
-    return r.text
+    _robots_cache[domain] = (now, allowed)
+    return allowed
 
 
 def _fetch_raw(url: str):
-    """Haalt HTML of PDF op met SSRF-check, robots-check, throttling en begrensde cache."""
     _check_safe_url(url)
     if not _robots_allows(url):
         raise ValueError(f"robots.txt van {_domain(url)} verbiedt dit")
-
     now = time.time()
     cached = _response_cache.get(url)
     if cached and now - cached[0] < CACHE_TTL:
         _response_cache.move_to_end(url)
         return cached[1], cached[2]
-
     _throttle(_domain(url))
-    try:
-        r = requests.get(url, headers={"User-Agent": scrape.USER_AGENT}, timeout=20)
-        r.raise_for_status()
-        ctype = r.headers.get("Content-Type", "").lower()
-        if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
-            result = ("pdf", r.content)
-        else:
-            result = ("html", r.text)
-    except requests.HTTPError as e:
-        if USE_JINA_FALLBACK and e.response is not None and e.response.status_code in (401, 403, 429):
-            result = ("markdown_fallback", _fetch_jina_fallback(url))
-        else:
-            raise
-
-    # Bewaar geen enorme bestanden (> 2 MB) in de kleine Render-cache
+    r = requests.get(url, headers={"User-Agent": scrape.USER_AGENT}, timeout=20)
+    r.raise_for_status()
+    ctype = r.headers.get("Content-Type", "").lower()
+    if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+        result = ("pdf", r.content)
+    else:
+        result = ("html", r.text)
     if len(result[1]) < 2_000_000:
         if len(_response_cache) >= MAX_CACHE_ITEMS:
             _response_cache.popitem(last=False)
@@ -166,24 +144,11 @@ def _extract_text(url: str, max_chars=None, as_markdown: bool = False) -> str:
     typ, data = _fetch_raw(url)
     if typ == "pdf":
         reader = PdfReader(io.BytesIO(data))
-        pages = [page.extract_text() or "" for page in reader.pages]
-        text = "\n\n".join(pages).strip()
-    elif typ == "markdown_fallback":
-        text = data
+        text = "\n\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    elif as_markdown:
+        text = tf_extract(data, output_format="markdown", include_tables=True, include_links=True) or ""
     else:
-        fmt = "markdown" if as_markdown else "txt"
-        text = tf_extract(
-            data,
-            output_format=fmt,
-            include_links=as_markdown,
-            include_tables=True,
-        ) or ""
-        # Als de pagina leeg lijkt (bijv. React/JavaScript site), probeer Jina fallback
-        if not text.strip() and USE_JINA_FALLBACK:
-            try:
-                text = _fetch_jina_fallback(url)
-            except Exception:
-                pass
+        text = tf_extract(data, output_format="txt") or ""
     return text if max_chars is None else text[:max_chars]
 
 
@@ -205,14 +170,10 @@ def fetch_page(url: str, format: str = "markdown", max_chars: int = 8000, link_f
     typ, data = _fetch_raw(url)
     fmt = (format or "markdown").lower()
     if fmt in ("text", "markdown"):
-        return {
-            "format": fmt,
-            "url": url,
-            "text": _extract_text(url, max_chars, as_markdown=(fmt == "markdown")),
-        }
+        return {"format": fmt, "url": url, "text": _extract_text(url, max_chars, as_markdown=(fmt == "markdown"))}
     if fmt == "html":
         if typ == "pdf":
-            raise ValueError("PDF heeft geen html-format; gebruik text/markdown/summary")
+            raise ValueError("PDF heeft geen html-format; gebruik markdown/text/summary")
         return {"format": "html", "url": url, "html": data[:max_chars]}
     if fmt == "json":
         if typ == "pdf":
@@ -220,7 +181,7 @@ def fetch_page(url: str, format: str = "markdown", max_chars: int = 8000, link_f
         return {"format": "json", "url": url, "json": json.loads(data)}
     if fmt == "links":
         if typ != "html":
-            raise ValueError("Geen directe HTML beschikbaar voor links; gebruik text/markdown")
+            raise ValueError("Geen directe HTML; gebruik markdown/text")
         soup = BeautifulSoup(data, "lxml")
         out = []
         for a in soup.find_all("a", href=True):
@@ -236,8 +197,8 @@ def fetch_page(url: str, format: str = "markdown", max_chars: int = 8000, link_f
             return {"format": "metadata", "url": url, "metadata": {"pagetype": "pdf"}}
         return {"format": "metadata", "url": url, "metadata": _meta_dict(data)}
     if fmt == "summary":
-        text = _extract_text(url, as_markdown=False)
-        sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+        text = _extract_text(url)
+        sentences = re.split(r"(?<=[.!?])\\s+", text.replace("\n", " "))
         return {"format": "summary", "url": url, "summary": " ".join(sentences[:5])[:1200]}
     raise ValueError(f"Onbekend format '{format}' — kies: markdown, text, html, json, links, metadata, summary")
 
@@ -299,8 +260,8 @@ def map_site(url: str, limit: int = 200, search: str = "", link_filter: str = ""
 
 @mcp.tool()
 def crawl_site(url: str, max_pages: int = 5, max_chars: int = 4000, link_filter: str = "") -> dict:
-    """Haal de startpagina op en volg links binnen hetzelfde domein (max max_pages, begrensd op 15)."""
-    max_pages = min(max_pages, 15)
+    """Haal de startpagina op en volg links binnen hetzelfde domein (max 15 pagina's)."""
+    max_pages = min(max(int(max_pages), 1), 15)
     results = {}
     to_visit = [url]
     seen = set()
@@ -325,7 +286,7 @@ def crawl_site(url: str, max_pages: int = 5, max_chars: int = 4000, link_filter:
     return {"start": url, "pages": len(results), "results": results}
 
 
-PRICE_RE = re.compile(r"(?:€|EUR)\s?(\d{1,6}(?:[.,]\d{1,2})?)|(\d{1,6}[.,]\d{2})\s?(?:€|EUR)", re.IGNORECASE)
+PRICE_RE = re.compile(r"(?:€|EUR)\\s?(\\d{1,6}(?:[.,]\\d{1,2})?)|(\\d{1,6}[.,]\\d{2})\\s?(?:€|EUR)", re.IGNORECASE)
 
 
 def _parse_price(text):
@@ -426,7 +387,7 @@ def _do_extract_products(url: str) -> dict:
 
 @mcp.tool()
 def extract_products(url: str) -> dict:
-    """Haal product-/prijsinformatie uit een productpagina (JSON-LD Product/Offer eerst, regex als fallback)."""
+    """Haal product-/prijsinformatie uit een productpagina (JSON-LD Product/Offer incl. lowPrice, regex als fallback)."""
     return _do_extract_products(url)
 
 
@@ -437,7 +398,7 @@ def compare_prices(urls: str) -> dict:
     """
     all_offers = []
     errors = {}
-    for u in [x.strip() for x in re.split(r"[,\n]", urls) if x.strip()]:
+    for u in [x.strip() for x in re.split(r"[,\\n]", urls) if x.strip()]:
         try:
             all_offers.extend(_do_extract_products(u)["products"])
         except Exception as e:
@@ -449,41 +410,28 @@ def compare_prices(urls: str) -> dict:
         "sorted_by_price": with_price,
         "without_price": [o for o in all_offers if o.get("price") is None],
         "errors": errors,
-        "note": "Prijzen zijn excl. verzendkosten; controleer voorraadstatus per winkel.",
+        "note": "Prijzen zijn excl. verzendkosten; controleer de voorraadstatus per winkel.",
     }
 
 
 @mcp.tool()
 def search_web(query: str, num_results: int = 10, site: str = "") -> dict:
-    """Zoek op het web via DuckDuckGo. site: bv '.be', '.nl' of 'bol.com' om te beperken tot een domein."""
+    """Zoek op het web. site: bv '.be', '.nl' of 'bol.com' om te beperken tot een domein."""
     q = query + (f" site:{site}" if site else "")
-    num_results = min(num_results, 25)
-
-    # Methode 1: via ddgs package (stabieler tegen anti-bot op Render IP's)
+    num_results = min(max(int(num_results), 1), 25)
     if DDGS is not None:
         try:
             results = DDGS().text(q, max_results=num_results)
             out = [
-                {
-                    "title": _clean(r.get("title", "")),
-                    "url": _clean(r.get("href", "")),
-                    "snippet": _clean(r.get("body", "")),
-                }
+                {"title": _clean(r.get("title", "")), "url": _clean(r.get("href", "")), "snippet": _clean(r.get("body", ""))}
                 for r in results
             ]
             if out:
                 return {"query": q, "count": len(out), "results": out, "source": "ddgs"}
         except Exception:
             pass
-
-    # Methode 2: HTML fallback
     _throttle("html.duckduckgo.com")
-    r = requests.post(
-        "https://html.duckduckgo.com/html/",
-        data={"q": q},
-        headers={"User-Agent": scrape.USER_AGENT},
-        timeout=20,
-    )
+    r = requests.post("https://html.duckduckgo.com/html/", data={"q": q}, headers={"User-Agent": scrape.USER_AGENT}, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
     out = []
@@ -495,11 +443,11 @@ def search_web(query: str, num_results: int = 10, site: str = "") -> dict:
         m = re.search(r"uddg=([^&]+)", href)
         if m:
             href = unquote(m.group(1))
-        snippet_el = res.select_one(".result__snippet")
+        snip = res.select_one(".result__snippet")
         out.append({
             "title": _clean(a.get_text(strip=True)),
             "url": _clean(href),
-            "snippet": _clean(snippet_el.get_text(strip=True)) if snippet_el else "",
+            "snippet": _clean(snip.get_text(strip=True)) if snip else "",
         })
         if len(out) >= num_results:
             break
@@ -507,29 +455,20 @@ def search_web(query: str, num_results: int = 10, site: str = "") -> dict:
 
 
 @mcp.tool()
-def shopify_products(
-    domain: str,
-    collection: str = "all",
-    search: str = "",
-    max_products: int = 50,
-    available_only: bool = False,
-) -> dict:
-    """Lees de productcatalogus van een Shopify-shop via /products.json.
-    domain: bv. 'parfumado.com'.
-    collection: 'all' of een collectie-slug bv. 'parfums'.
-    search: optionele zoekterm om te filteren op titel, merk (vendor) of tags.
-    max_products: max aantal producten terug te geven (default 50 om AI-context niet te overspoelen).
+def shopify_products(domain: str, collection: str = "all", search: str = "", max_products: int = 50, available_only: bool = False) -> dict:
+    """Lees de productcatalogus van een Shopify-shop via de publieke /products.json API (paginering).
+    domain: bv. 'parfumado.com'. collection: 'all' of een collectie-slug.
+    search: optionele filter op titel, vendor of tags. max_products: default 50 (beschermt de AI-context).
     """
     domain = _clean(domain).replace("https://", "").replace("http://", "").strip("/")
     base = f"https://{domain}"
     _check_safe_url(base)
     fetched_at = _now()
+    max_products = min(max(int(max_products), 1), 1000)
     products = []
-    page = 1
-    max_pages_to_scan = 10  # voorkom eindeloze loops op enorme shops
     search_low = search.lower().strip()
-
-    while len(products) < max_products and page <= max_pages_to_scan:
+    page = 1
+    while len(products) < max_products and page <= 10:
         if collection and collection != "all":
             api = f"{base}/collections/{collection}/products.json"
         else:
@@ -537,12 +476,7 @@ def shopify_products(
         if not _robots_allows(api):
             raise ValueError(f"robots.txt van {domain} verbiedt dit")
         _throttle(domain)
-        r = requests.get(
-            api,
-            params={"limit": 250, "page": page},
-            headers={"User-Agent": scrape.USER_AGENT},
-            timeout=20,
-        )
+        r = requests.get(api, params={"limit": 250, "page": page}, headers={"User-Agent": scrape.USER_AGENT}, timeout=20)
         if r.status_code == 404:
             raise ValueError(f"Geen products.json op {base} — geen Shopify-shop of endpoint geblokkeerd")
         r.raise_for_status()
@@ -552,16 +486,68 @@ def shopify_products(
         for p in batch:
             variants = p.get("variants") or []
             v0 = variants[0] if variants else {}
-            is_avail = any(bool(v.get("available", False)) for v in variants) if variants else False
-            if available_only and not is_avail:
+            available = any(bool(v.get("available")) for v in variants) if variants else False
+            if available_only and not available:
                 continue
-
             title = _clean(p.get("title", ""))
             vendor = _clean(p.get("vendor", ""))
             raw_tags = p.get("tags") or []
             if isinstance(raw_tags, str):
-                tags = [_clean(t) for t in raw_tags.split(",") if t.strip()]
-            else:
-                tags = [_clean(t) for t in raw_tags if isinstance(t, str)]
+                raw_tags = raw_tags.split(",")
+            tags = [_clean(t) for t in raw_tags if isinstance(t, str) and t.strip()]
+            body = p.get("body_html") or ""
+            desc = BeautifulSoup(body, "lxml").get_text(" ", strip=True)[:350] if body else ""
+            if search_low and search_low not in f"{title} {vendor} {' '.join(tags)} {desc}".lower():
+                continue
+            products.append({
+                "title": title,
+                "vendor": vendor,
+                "product_type": _clean(p.get("product_type", "")),
+                "tags": tags,
+                "price": _parse_price(v0.get("price")),
+                "sku": _clean(v0.get("sku", "")),
+                "available": available,
+                "url": f"{base}/products/{_clean(p.get('handle', ''))}",
+                "image": (p.get("images") or [{}])[0].get("src", ""),
+                "description": desc,
+                "fetched_at": fetched_at,
+            })
+            if len(products) >= max_products:
+                break
+        if len(batch) < 250:
+            break
+        page += 1
+    return {"shop": domain, "collection": collection, "search": search, "fetched_at": fetched_at, "count": len(products), "products": products}
 
-            raw_body = p.get("
+
+async def health(request):
+    return JSONResponse({"status": "ok", "service": "mijn-scraper", "time": _now()})
+
+
+class TokenAuthASGI:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path", "") in ("/", "/health"):
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+        token = headers.get("x-scraper-token", "")
+        auth = headers.get("authorization", "")
+        bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not (hmac.compare_digest(token, API_TOKEN) or hmac.compare_digest(bearer, API_TOKEN)):
+            resp = JSONResponse({"error": "unauthorized"}, status_code=401)
+            await resp(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+if __name__ == "__main__":
+    app = mcp.streamable_http_app()
+    app.routes.append(Route("/health", health, methods=["GET"]))
+    uvicorn.run(TokenAuthASGI(app), host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    
