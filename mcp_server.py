@@ -32,6 +32,14 @@ _robots_cache = {}
 _last_request = {}
 
 
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+
+def _clean(v):
+    return v.strip() if isinstance(v, str) else v
+
+
 def _domain(url: str) -> str:
     return urlparse(url).netloc.lower()
 
@@ -99,13 +107,13 @@ def _meta_dict(html: str) -> dict:
         return {}
     meta = doc.as_dict() if hasattr(doc, "as_dict") else dict(vars(doc))
     keys = ("title", "author", "description", "sitename", "date", "pagetype", "lang", "hostname", "categories", "tags")
-    return {k: meta.get(k) for k in keys if meta.get(k)}
+    return {k: _clean(meta.get(k)) for k in keys if meta.get(k)}
 
 
 @mcp.tool()
 def fetch_page(url: str, format: str = "text", max_chars: int = 8000, link_filter: str = "") -> dict:
-    """Lees een webpagina (HTML of PDF).
-    format: text (default) | markdown | html | links | metadata | summary
+    """Lees een webpagina (HTML, PDF of JSON-endpoint).
+    format: text (default) | markdown | html | json | links | metadata | summary
     link_filter: optionele regex waar link-URLs aan moeten voldoen (alleen bij format=links)
     """
     typ, data = _fetch_raw(url)
@@ -116,16 +124,20 @@ def fetch_page(url: str, format: str = "text", max_chars: int = 8000, link_filte
         if typ == "pdf":
             raise ValueError("PDF heeft geen html-format; gebruik text/markdown/summary")
         return {"format": "html", "url": url, "html": data[:max_chars]}
+    if fmt == "json":
+        if typ == "pdf":
+            raise ValueError("PDF is geen JSON")
+        return {"format": "json", "url": url, "json": json.loads(data)}
     if fmt == "links":
         if typ == "pdf":
             raise ValueError("PDF heeft geen links; gebruik text/markdown/summary")
         soup = BeautifulSoup(data, "lxml")
         out = []
         for a in soup.find_all("a", href=True):
-            link = urljoin(url, a["href"]).split("#")[0]
+            link = _clean(urljoin(url, a["href"]).split("#")[0])
             if link_filter and not re.search(link_filter, link):
                 continue
-            out.append({"url": link, "text": a.get_text(strip=True)[:120]})
+            out.append({"url": link, "text": _clean(a.get_text(strip=True))[:120]})
             if len(out) >= 500:
                 break
         return {"format": "links", "url": url, "count": len(out), "links": out}
@@ -137,7 +149,7 @@ def fetch_page(url: str, format: str = "text", max_chars: int = 8000, link_filte
         text = _extract_text(url)
         sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
         return {"format": "summary", "url": url, "summary": " ".join(sentences[:5])[:1200]}
-    raise ValueError(f"onbekend format '{format}' — kies: text, markdown, html, links, metadata, summary")
+    raise ValueError(f"onbekend format '{format}' — kies: text, markdown, html, json, links, metadata, summary")
 
 
 @mcp.tool()
@@ -169,7 +181,7 @@ def map_site(url: str, limit: int = 200, search: str = "", link_filter: str = ""
             for loc in root.iter("{*}loc"):
                 if not loc.text:
                     continue
-                u = loc.text.strip()
+                u = _clean(loc.text)
                 if u.lower().endswith(".xml"):
                     parse_sitemap(u, depth + 1)
                 else:
@@ -183,7 +195,7 @@ def map_site(url: str, limit: int = 200, search: str = "", link_filter: str = ""
         if typ == "html":
             soup = BeautifulSoup(data, "lxml")
             for a in soup.find_all("a", href=True):
-                link = urljoin(url, a["href"]).split("#")[0]
+                link = _clean(urljoin(url, a["href"]).split("#")[0])
                 if link.startswith("http") and _domain(link) == _domain(url):
                     urls.add(link)
     result = sorted(urls)
@@ -211,7 +223,7 @@ def crawl_site(url: str, max_pages: int = 10, max_chars: int = 4000, link_filter
             if typ == "html" and _domain(current) == _domain(url):
                 soup = BeautifulSoup(data, "lxml")
                 for a in soup.find_all("a", href=True):
-                    link = urljoin(current, a["href"]).split("#")[0]
+                    link = _clean(urljoin(current, a["href"]).split("#")[0])
                     if link.startswith("http") and _domain(link) == _domain(url) and link not in seen:
                         if link_filter and not re.search(link_filter, link):
                             continue
@@ -221,7 +233,7 @@ def crawl_site(url: str, max_pages: int = 10, max_chars: int = 4000, link_filter
     return {"start": url, "pages": len(results), "results": results}
 
 
-PRICE_RE = re.compile(r"(?:€|EUR)\\s?(\\d{1,6}(?:[.,]\\d{1,2})?)|(\\d{1,6}[.,]\\d{2})\\s?(?:€|EUR)", re.IGNORECASE)
+PRICE_RE = re.compile(r"(?:€|EUR)\s?(\d{1,6}(?:[.,]\d{1,2})?)|(\d{1,6}[.,]\d{2})\s?(?:€|EUR)", re.IGNORECASE)
 
 
 def _parse_price(text):
@@ -253,9 +265,10 @@ def _walk_jsonld(obj):
 
 
 def _do_extract_products(url: str) -> dict:
+    fetched_at = _now()
     typ, data = _fetch_raw(url)
     if typ == "pdf":
-        return {"url": url, "shop": _domain(url), "count": 0, "products": [], "note": "PDF: geen product-extractie"}
+        return {"url": url, "shop": _domain(url), "fetched_at": fetched_at, "count": 0, "products": [], "note": "PDF: geen product-extractie"}
     html = data
     products = []
     soup = BeautifulSoup(html, "lxml")
@@ -279,15 +292,21 @@ def _do_extract_products(url: str) -> dict:
                 brand = p.get("brand")
                 if isinstance(brand, dict):
                     brand = brand.get("name")
+                availability = str(o.get("availability", ""))
                 products.append({
-                    "name": p.get("name") or "",
+                    "name": _clean(p.get("name") or ""),
                     "price": _parse_price(price) if price is not None else None,
                     "currency": o.get("priceCurrency", "EUR"),
-                    "availability": str(o.get("availability", "")).split("/")[-1],
-                    "brand": brand or "",
+                    "available": availability.endswith("InStock"),
+                    "availability": availability.split("/")[-1],
+                    "brand": _clean(brand or ""),
+                    "vendor": _clean(p.get("vendor") or ""),
+                    "product_type": _clean(p.get("product_type") or ""),
+                    "tags": [_clean(t) for t in (p.get("tags") or []) if isinstance(t, str)],
                     "url": url,
                     "shop": _domain(url),
                     "source": "json-ld",
+                    "fetched_at": fetched_at,
                 })
     if not products:
         text = tf_extract(html) or ""
@@ -296,21 +315,26 @@ def _do_extract_products(url: str) -> dict:
             og = soup.find("meta", property="og:title")
             title = og["content"] if og and og.get("content") else (soup.title.get_text(strip=True) if soup.title else "")
             products.append({
-                "name": title,
+                "name": _clean(title),
                 "price": _parse_price(m.group(1) or m.group(2)),
                 "currency": "EUR",
+                "available": None,
                 "availability": "",
                 "brand": "",
+                "vendor": "",
+                "product_type": "",
+                "tags": [],
                 "url": url,
                 "shop": _domain(url),
                 "source": "regex-fallback",
+                "fetched_at": fetched_at,
             })
-    return {"url": url, "shop": _domain(url), "count": len(products), "products": products}
+    return {"url": url, "shop": _domain(url), "fetched_at": fetched_at, "count": len(products), "products": products}
 
 
 @mcp.tool()
 def extract_products(url: str) -> dict:
-    """Haal product-/prijsinformatie uit een productpagina (JSON-LD Product/Offer eerst, regex als fallback)."""
+    """Haal product-/prijsinformatie uit een productpagina (JSON-LD Product/Offer eerst, regex als fallback). Alle velden gestript, met fetched_at."""
     return _do_extract_products(url)
 
 
@@ -328,12 +352,12 @@ def compare_prices(urls: str) -> dict:
             errors[u] = str(e)
     with_price = sorted([o for o in all_offers if o.get("price") is not None], key=lambda o: (o["price"], o.get("shop", "")))
     return {
-        "fetched_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
+        "fetched_at": _now(),
         "offers_with_price": len(with_price),
         "sorted_by_price": with_price,
         "without_price": [o for o in all_offers if o.get("price") is None],
         "errors": errors,
-        "note": "prijzen excl. Versandkosten; controleer availability per winkel",
+        "note": "prijzen excl. Produitkosten; controleer available per winkel",
     }
 
 
@@ -358,13 +382,63 @@ def search_web(query: str, num_results: int = 10, site: str = "") -> dict:
             href = unquote(m.group(1))
         snippet_el = res.select_one(".result__snippet")
         out.append({
-            "title": a.get_text(strip=True),
-            "url": href,
-            "snippet": snippet_el.get_text(strip=True) if snippet_el else "",
+            "title": _clean(a.get_text(strip=True)),
+            "url": _clean(href),
+            "snippet": _clean(snippet_el.get_text(strip=True)) if snippet_el else "",
         })
         if len(out) >= num_results:
             break
     return {"query": q, "count": len(out), "results": out}
+
+
+@mcp.tool()
+def shopify_products(domain: str, collection: str = "all", max_products: int = 1000, available_only: bool = False) -> dict:
+    """Lees de productcatalogus van een Shopify-shop via de publieke JSON-API (/products.json), met paginering.
+    domain: bv. 'parfumado.com'. collection: 'all' (hele shop) of een collectie-slug bv. 'parfums'.
+    Geeft schone records: title, vendor, product_type, tags, price, sku, available (bool), url, image, body_html, fetched_at.
+    """
+    domain = _clean(domain).replace("https://", "").replace("http://", "").strip("/")
+    base = f"https://{domain}"
+    fetched_at = _now()
+    products = []
+    page = 1
+    while len(products) < max_products:
+        if collection and collection != "all":
+            api = f"{base}/collections/{collection}/products.json"
+        else:
+            api = f"{base}/products.json"
+        if not _robots_allows(api):
+            raise ValueError(f"robots.txt van {domain} verbiedt dit")
+        _throttle(domain)
+        r = requests.get(api, params={"limit": 250, "page": page}, headers={"User-Agent": scrape.USER_AGENT}, timeout=20)
+        if r.status_code == 404:
+            raise ValueError(f"geen products.json op {base} — geen Shopify-shop of endpoint geblokkeerd")
+        r.raise_for_status()
+        batch = r.json().get("products", [])
+        if not batch:
+            break
+        for p in batch:
+            variants = p.get("variants") or []
+            v0 = variants[0] if variants else {}
+            products.append({
+                "title": _clean(p.get("title", "")),
+                "vendor": _clean(p.get("vendor", "")),
+                "product_type": _clean(p.get("product_type", "")),
+                "tags": [_clean(t) for t in (p.get("tags") or []) if isinstance(t, str)],
+                "price": _parse_price(v0.get("price")) if v0.get("price") is not None else None,
+                "sku": _clean(v0.get("sku", "")),
+                "available": bool(v0.get("available", False)),
+                "url": f"{base}/products/{_clean(p.get('handle', ''))}",
+                "image": (p.get("images") or [{}])[0].get("src", ""),
+                "body_html": p.get("body_html", ""),
+                "fetched_at": fetched_at,
+            })
+        if len(batch) < 250:
+            break
+        page += 1
+    if available_only:
+        products = [p for p in products if p["available"]]
+    return {"shop": domain, "collection": collection, "fetched_at": fetched_at, "count": len(products), "products": products[:max_products]}
 
 
 class TokenCheck(BaseHTTPMiddleware):
