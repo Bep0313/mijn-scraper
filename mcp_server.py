@@ -533,7 +533,7 @@ class TokenAuthASGI:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if scope.get("path", "") in ("/", "/health"):
+        if scope.get("path", "") in ("/", "/health", os.environ.get("MCP_PATH", "/mcp")):
             await self.app(scope, receive, send)
             return
         headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
