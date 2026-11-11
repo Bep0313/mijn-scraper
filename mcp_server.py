@@ -31,6 +31,7 @@ except ImportError:
     DDGS = None
 
 import scrape
+import tracker
 
 API_TOKEN = os.environ.get("SCRAPER_TOKEN", "").strip()
 if not API_TOKEN:
@@ -548,7 +549,9 @@ class TokenAuthASGI:
 
 
 if __name__ == "__main__":
+    tracker.register(mcp, _do_extract_products, _now)
     app = mcp.streamable_http_app()
     app.routes.append(Route("/health", health, methods=["GET"]))
+    app.routes.append(Route("/scrape-all", tracker.scrape_all_endpoint, methods=["POST"]))
     uvicorn.run(TokenAuthASGI(app), host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
     
