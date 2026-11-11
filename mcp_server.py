@@ -46,6 +46,7 @@ mcp = FastMCP(
     port=int(os.environ.get("PORT", 8000)),
     stateless_http=True,
     json_response=True,
+    streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
 )
 
 _response_cache = OrderedDict()
