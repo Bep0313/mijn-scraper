@@ -51,7 +51,8 @@ def crawl_site(url: str, max_pages: int = 10, max_chars: int = 4000) -> dict:
 
 class TokenCheck(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        if request.headers.get("x-scraper-token") != API_TOKEN:
+        auth = request.headers.get("authorization", "")
+        if request.headers.get("x-scraper-token") != API_TOKEN and auth != f"Bearer {API_TOKEN}":
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
